@@ -5,6 +5,10 @@ import yfinance as yf
 
 TICKER = os.getenv("STOCK_TICKER", "AAPL")
 
+# Set to True if you want to buy EVERY day/week price is below the MA (Accumulation)
+# Set to False if you ONLY want to buy on the exact day it crosses below (Crossunder)
+CONTINUOUS_ACCUMULATION = True
+
 
 def fetch_data(ticker):
   print(f"Fetching data for {ticker}...")
@@ -20,8 +24,46 @@ def fetch_data(ticker):
   return df
 
 
+def prepare_indicators(df):
+  # 1. Daily Moving Averages
+  df["SMA_50_Daily"] = df["Close"].rolling(window=50).mean()
+  df["SMA_200_Daily"] = df["Close"].rolling(window=200).mean()
+
+  # 2. Weekly Moving Averages (Resampled to Friday close to align properly with daily data)
+  df_weekly = df["Close"].resample("W-FRI").last().to_frame()
+  df_weekly["SMA_50_Weekly"] = df_weekly["Close"].rolling(window=50).mean()
+  df_weekly["SMA_200_Weekly"] = df_weekly["Close"].rolling(window=200).mean()
+
+  # Merge weekly indicators back to daily dataframe and forward fill cleanly
+  df = df.join(
+      df_weekly[["SMA_50_Weekly", "SMA_200_Weekly"]], how="left"
+  ).ffill()
+
+  if CONTINUOUS_ACCUMULATION:
+    # Buy every single day the price is strictly below the MA
+    df["Trigger_50D"] = df["Close"] < df["SMA_50_Daily"]
+    df["Trigger_200D"] = df["Close"] < df["SMA_200_Daily"]
+    df["Trigger_50W"] = df["Close"] < df["SMA_50_Weekly"]
+    df["Trigger_200W"] = df["Close"] < df["SMA_200_Weekly"]
+  else:
+    # Buy only on the discrete crossunder event (crossing from above to below)
+    df["Trigger_50D"] = (df["Close"] < df["SMA_50_Daily"]) & (
+        df["Close"].shift(1) >= df["SMA_50_Daily"].shift(1)
+    )
+    df["Trigger_200D"] = (df["Close"] < df["SMA_200_Daily"]) & (
+        df["Close"].shift(1) >= df["SMA_200_Daily"].shift(1)
+    )
+    df["Trigger_50W"] = (df["Close"] < df["SMA_50_Weekly"]) & (
+        df["Close"].shift(1) >= df["SMA_50_Weekly"].shift(1)
+    )
+    df["Trigger_200W"] = (df["Close"] < df["SMA_200_Weekly"]) & (
+        df["Close"].shift(1) >= df["SMA_200_Weekly"].shift(1)
+    )
+
+  return df
+
+
 def run_scenario_backtest(df, trigger_col_name, horizon_years):
-  """Runs a backtest for a single specific MA trigger condition over a given horizon."""
   end_date = df.index[-1]
   start_date = end_date - pd.DateOffset(years=horizon_years)
 
@@ -60,41 +102,16 @@ def run_scenario_backtest(df, trigger_col_name, horizon_years):
   }
 
 
-def prepare_indicators(df):
-  # 1. Daily MAs
-  df["SMA_50_Daily"] = df["Close"].rolling(window=50).mean()
-  df["SMA_200_Daily"] = df["Close"].rolling(window=200).mean()
-
-  # 2. Weekly MAs
-  df_weekly = df["Close"].resample("W").last().to_frame()
-  df_weekly["SMA_50_Weekly"] = df_weekly["Close"].rolling(window=50).mean()
-  df_weekly["SMA_200_Weekly"] = df_weekly["Close"].rolling(window=200).mean()
-
-  df = df.join(
-      df_weekly[["SMA_50_Weekly", "SMA_200_Weekly"]], how="left"
-  ).ffill()
-
-  # Discrete crossunder triggers (Close drops below MA)
-  df["Trigger_50D"] = (df["Close"] < df["SMA_50_Daily"]) & (
-      df["Close"].shift(1) >= df["SMA_50_Daily"].shift(1)
-  )
-  df["Trigger_200D"] = (df["Close"] < df["SMA_200_Daily"]) & (
-      df["Close"].shift(1) >= df["SMA_200_Daily"].shift(1)
-  )
-  df["Trigger_50W"] = (df["Close"] < df["SMA_50_Weekly"]) & (
-      df["Close"].shift(1) >= df["SMA_50_Weekly"].shift(1)
-  )
-  df["Trigger_200W"] = (df["Close"] < df["SMA_200_Weekly"]) & (
-      df["Close"].shift(1) >= df["SMA_200_Weekly"].shift(1)
-  )
-
-  return df
-
-
 def generate_markdown_report(ticker, current_price, results_dict):
+  mode_str = (
+      "Continuous Accumulation (Every day price is below MA)"
+      if CONTINUOUS_ACCUMULATION
+      else "Discrete Crossunder (Only when price first drops below MA)"
+  )
   md = f"""# 📊 Moving Average Strategy Comparison Report: `{ticker.upper()}`
 
-> **Testing Rule:** Buy 1 unit every time the price crosses below the specified Moving Average benchmark. Each scenario is tracked independently.
+> **Mode:** {mode_str}  
+> **Rule:** Buy 1 unit of stock whenever price triggers the condition. Each Moving Average is tracked as an independent scenario.
 
 * **Current Market Price:** `${current_price:,.2f}`
 
@@ -111,18 +128,18 @@ def generate_markdown_report(ticker, current_price, results_dict):
   horizons = [1, 5, 10]
 
   for scen_name, scen_key in scenarios:
-    md += f"### Scenario: Buying on Crossunder of **{scen_name}**\n\n"
+    md += f"### Scenario: **{scen_name}**\n\n"
     md += "| Time Horizon | Shares Held | Invested ($) | Final Value ($) | Absolute Return | Annualized Return |\n"
     md += "| :--- | :---: | :---: | :---: | :---: | :---: |\n"
 
     for h in horizons:
       res = results_dict.get((scen_key, h))
-      if res:
+      if res and res["shares_held"] > 0:
         abs_emoji = "🟢" if res["absolute_return_pct"] >= 0 else "🔴"
         ann_emoji = "🟢" if res["annualized_return_pct"] >= 0 else "🔴"
         md += f"| **{h} Year** | {res['shares_held']} | ${res['total_invested']:,.2f} | ${res['portfolio_value']:,.2f} | {abs_emoji} {res['absolute_return_pct']:+.2f}% | {ann_emoji} {res['annualized_return_pct']:+.2f}% |\n"
       else:
-        md += f"| **{h} Year** | N/A | N/A | N/A | N/A | N/A |\n"
+        md += f"| **{h} Year** | 0 | $0.00 | $0.00 | 0.00% | 0.00% |\n"
 
     md += "\n"
 
@@ -150,7 +167,6 @@ if __name__ == "__main__":
 
   report_md = generate_markdown_report(TICKER, current_price, results_dict)
 
-  # Publish to GitHub Actions Job Summary
   github_summary_path = os.getenv("GITHUB_STEP_SUMMARY")
   if github_summary_path:
     with open(github_summary_path, "a") as summary_file:
