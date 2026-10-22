@@ -196,11 +196,20 @@ def send_email(html_content, ticker):
 
   msg.attach(MIMEText(html_content, "html"))
 
-  print(f"Sending email report to {RECIPIENT_EMAIL}...")
-  with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-    server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-    server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
-  print("Email sent successfully!")
+  print(f"Sending email report to {RECIPIENT_EMAIL} via TLS (Port 587)...")
+
+  # Use Port 587 with STARTTLS for reliable cloud execution
+  try:
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+      server.ehlo()
+      server.starttls()
+      server.ehlo()
+      server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+      server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
+    print("Email sent successfully!")
+  except Exception as e:
+    print(f"Failed to send email: {e}")
+    raise e
 
 
 if __name__ == "__main__":
