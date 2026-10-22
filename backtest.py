@@ -1,27 +1,18 @@
 import os
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Configuration via Environment Variables (configured in GitHub Secrets)
 TICKER = os.getenv("STOCK_TICKER", "AAPL")
-GMAIL_USER = os.getenv("GMAIL_USER")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", GMAIL_USER)
 
 
 def fetch_data(ticker):
   print(f"Fetching data for {ticker}...")
-  # Fetch max historical daily data to compute daily and weekly indicators accurately
   df = yf.download(ticker, period="max", interval="1d", progress=False)
 
   if df.empty:
     raise ValueError(f"No data found for ticker: {ticker}")
 
-  # Flatten columns if multi-index is returned by yfinance
   if isinstance(df.columns, pd.MultiIndex):
     df.columns = df.columns.get_level_values(0)
 
@@ -30,27 +21,16 @@ def fetch_data(ticker):
 
 
 def run_backtest(df):
-  # 1. Compute Daily Moving Averages
   df["SMA_50_Daily"] = df["Close"].rolling(window=50).mean()
   df["SMA_200_Daily"] = df["Close"].rolling(window=200).mean()
 
-  # 2. Resample to Weekly to compute Weekly Moving Averages
   df_weekly = df["Close"].resample("W").last().to_frame()
   df_weekly["SMA_50_Weekly"] = df_weekly["Close"].rolling(window=50).mean()
   df_weekly["SMA_200_Weekly"] = df_weekly["Close"].rolling(window=200).mean()
 
-  # Merge weekly indicators back to daily dataframe via forward fill
   df = df.join(
       df_weekly[["SMA_50_Weekly", "SMA_200_Weekly"]], how="left"
   ).ffill()
-
-  # Identify crossing/touching events (Close < MA)
-  # To avoid buying every single day the price stays below, we can trigger a buy
-  # when the close crosses below the MA, or every day it trades below depending on strictness.
-  # Here, we trigger a buy on days where Close < MA AND previous Close >= MA (Discrete Crossunder),
-  # or continuously if you prefer accumulation on any day below. Let's use discrete crossunder
-  # for realistic accumulation triggers, or daily conditions.
-  # User prompt: "Everytime I buy a stock when it goes below its [MAs]... buy one stick qty."
 
   df["Trigger_50D"] = (df["Close"] < df["SMA_50_Daily"]) & (
       df["Close"].shift(1) >= df["SMA_50_Daily"].shift(1)
@@ -85,9 +65,8 @@ def calculate_performance(df, years):
 
   shares_held = 0
   total_invested = 0.0
-  cash_flow_records = []
 
-  for date, row in sub_df.iterrows():
+  for _, row in sub_df.iterrows():
     buys = int(row["Total_Buys_Today"])
     price = float(row["Close"])
     if buys > 0:
@@ -100,16 +79,11 @@ def calculate_performance(df, years):
   absolute_return_pct = (
       (net_profit / total_invested * 100) if total_invested > 0 else 0.0
   )
-
-  # Annualized Return (CAGR approximation based on holding period cash flows or simple CAGR)
-  # Standard CAGR on total invested vs final value can be skewed by periodic accumulation.
-  # Using Modified Dietz or XIRR style annualized approximation:
-  if total_invested > 0 and years > 0:
-    annualized_return_pct = (
-        (portfolio_value / total_invested) ** (1 / years) - 1
-    ) * 100
-  else:
-    annualized_return_pct = 0.0
+  annualized_return_pct = (
+      ((portfolio_value / total_invested) ** (1 / years) - 1) * 100
+      if total_invested > 0 and years > 0
+      else 0.0
+  )
 
   return {
       "horizon": f"{years} Year" if years > 1 else "1 Year",
@@ -122,94 +96,26 @@ def calculate_performance(df, years):
   }
 
 
-def generate_html_report(ticker, current_price, metrics_list):
-  html = f"""
-    <html>
-      <head>
-        <style>
-          body {{ font-family: Arial, sans-serif; color: #333333; line-height: 1.6; }}
-          .container {{ max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px; background-color: #f9f9f9; }}
-          h2 {{ color: #1a73e8; border-bottom: 2px solid #1a73e8; padding-bottom: 8px; }}
-          .summary-box {{ background: #ffffff; padding: 15px; border-radius: 6px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
-          table {{ width: 100%; border-collapse: collapse; background: #ffffff; border-radius: 6px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
-          th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid #eeeeee; }}
-          th {{ background-color: #1a73e8; color: #ffffff; font-weight: 600; }}
-          tr:hover {{ background-color: #f1f3f4; }}
-          .positive {{ color: #0d652d; font-weight: bold; }}
-          .negative {{ color: #c5221f; font-weight: bold; }}
-          .footer {{ margin-top: 20px; font-size: 12px; color: #777777; text-align: center; }}
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h2>Moving Average Accumulation Strategy Report</h2>
-          <div class="summary-box">
-            <p><strong>Target Ticker:</strong> {ticker}</p>
-            <p><strong>Current Market Price:</strong> ${current_price:.2f}</p>
-            <p><strong>Strategy Rule:</strong> Buy 1 unit whenever the price crosses below the 50-day, 200-day, 50-week, or 200-week moving averages.</p>
-          </div>
-          
-          <table>
-            <tr>
-              <th>Time Horizon</th>
-              <th>Shares Held</th>
-              <th>Invested ($)</th>
-              <th>Final Value ($)</th>
-              <th>Absolute Return</th>
-              <th>Annualized Return</th>
-            </tr>
-  """
+def generate_markdown_report(ticker, current_price, metrics_list):
+  md = f"""# 📈 Moving Average Accumulation Strategy Report: `{ticker.upper()}`
+
+> **Strategy Rule:** Buy 1 unit whenever the price crosses below the 50-day, 200-day, 50-week, or 200-week moving averages.
+
+* **Current Market Price:** `${current_price:,.2f}`
+
+### Performance Summary
+
+| Time Horizon | Shares Held | Invested ($) | Final Value ($) | Absolute Return | Annualized Return |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+"""
 
   for m in metrics_list:
-    abs_class = "positive" if m["absolute_return_pct"] >= 0 else "negative"
-    ann_class = "positive" if m["annualized_return_pct"] >= 0 else "negative"
-    html += f"""
-            <tr>
-              <td><strong>{m['horizon']}</strong></td>
-              <td>{m['shares_held']}</td>
-              <td>${m['total_invested']:,.2f}</td>
-              <td>${m['portfolio_value']:,.2f}</td>
-              <td class="{abs_class}">{m['absolute_return_pct']:+.2f}%</td>
-              <td class="{ann_class}">{m['annualized_return_pct']:+.2f}%</td>
-            </tr>
-    """
+    abs_emoji = "🟢" if m["absolute_return_pct"] >= 0 else "🔴"
+    ann_emoji = "🟢" if m["annualized_return_pct"] >= 0 else "🔴"
+    md += f"| **{m['horizon']}** | {m['shares_held']} | ${m['total_invested']:,.2f} | ${m['portfolio_value']:,.2f} | {abs_emoji} {m['absolute_return_pct']:+.2f}% | {ann_emoji} {m['annualized_return_pct']:+.2f}% |\n"
 
-  html += f"""
-          </table>
-          <div class="footer">
-            <p>Automated report generated via GitHub Actions & Python.</p>
-          </div>
-        </div>
-      </body>
-    </html>
-    """
-  return html
-
-
-def send_email(html_content, ticker):
-  msg = MIMEMultipart("alternative")
-  msg["Subject"] = (
-      f"📈 MA Accumulation Strategy Backtest Report: {ticker.upper()}"
-  )
-  msg["From"] = GMAIL_USER
-  msg["To"] = RECIPIENT_EMAIL
-
-  msg.attach(MIMEText(html_content, "html"))
-
-  print(f"Sending email report to {RECIPIENT_EMAIL} via TLS (Port 587)...")
-
-  # Use Port 587 with STARTTLS for reliable cloud execution
-  try:
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-      server.ehlo()
-      server.starttls()
-      server.ehlo()
-      server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-      server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
-    print("Email sent successfully!")
-  except Exception as e:
-    print(f"Failed to send email: {e}")
-    raise e
+  md += "\n*Report automatically generated via GitHub Actions & Python.*"
+  return md
 
 
 if __name__ == "__main__":
@@ -224,5 +130,13 @@ if __name__ == "__main__":
     if res:
       metrics_list.append(res)
 
-  html_report = generate_html_report(TICKER, current_price, metrics_list)
-  send_email(html_report, TICKER)
+  report_md = generate_markdown_report(TICKER, current_price, metrics_list)
+
+  # Write directly to GitHub Actions Job Summary
+  github_summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+  if github_summary_path:
+    with open(github_summary_path, "a") as summary_file:
+      summary_file.write(report_md)
+    print("Report successfully published to GitHub Actions Job Summary!")
+  else:
+    print(report_md)
